@@ -1,6 +1,7 @@
 import { readFile, stat } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
+import { graphGet, getUserEmail, isGraphConfigured } from './graph-client';
 
 const CACHE_PATH = join(homedir(), 'briefing-data', 'teams-messages.txt');
 const M365_CACHE_PATH = join(homedir(), 'briefing-data', 'm365-teams.txt');
@@ -35,45 +36,27 @@ export async function fetchTeamsMessages(): Promise<string> {
     console.log('[teams] M365 cache is stale or missing — falling through');
   }
 
-  const clientId = process.env.AZURE_CLIENT_ID || process.env.MS_CLIENT_ID;
-  const tenantId = process.env.AZURE_TENANT_ID || process.env.MS_TENANT_ID;
-  const clientSecret = process.env.AZURE_CLIENT_SECRET || process.env.MS_CLIENT_SECRET;
-
-  if (clientId && tenantId && clientSecret) {
+  // Live Graph API via simple HTTP client — autonomous fetch
+  if (isGraphConfigured()) {
     try {
-      const { ClientSecretCredential } = await import('@azure/identity');
-      const { Client } = await import('@microsoft/microsoft-graph-client');
-      const { TokenCredentialAuthenticationProvider } = await import('@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials');
+      const userEmail = getUserEmail();
+      const cutoff = new Date(Date.now() - 18 * 3600 * 1000);
 
-      const credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
-      const authProvider = new TokenCredentialAuthenticationProvider(credential, {
-        scopes: ['https://graph.microsoft.com/.default'],
-      });
-
-      const graphClient = Client.initWithMiddleware({ authProvider });
-
-      // Get recent chat messages (last 18 hours)
-      const cutoff = new Date(Date.now() - 18 * 3600 * 1000).toISOString();
-
-      const chats = await graphClient.api('/me/chats')
-        .top(20)
-        .get();
-
+      const chats = await graphGet(`/users/${userEmail}/chats`, { '$top': '20' });
       const messages: string[] = [];
 
-      for (const chat of chats.value || []) {
+      for (const chat of chats?.value || []) {
         try {
-          const chatMessages = await graphClient.api(`/me/chats/${chat.id}/messages`)
-            .filter(`createdDateTime ge ${cutoff}`)
-            .top(10)
-            .get();
+          const chatMessages = await graphGet(`/users/${userEmail}/chats/${chat.id}/messages`, { '$top': '10' });
 
-          for (const msg of chatMessages.value || []) {
+          for (const msg of chatMessages?.value || []) {
             if (msg.body?.content && msg.from?.user?.displayName) {
+              const created = new Date(msg.createdDateTime);
+              if (created < cutoff) continue;
               const text = msg.body.content.replace(/<[^>]+>/g, '').trim();
               if (text.length > 5) {
                 const name = msg.from.user.displayName;
-                const time = new Date(msg.createdDateTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+                const time = created.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
                 messages.push(`[${time}] ${name}: ${text.slice(0, 300)}`);
               }
             }
@@ -83,13 +66,15 @@ export async function fetchTeamsMessages(): Promise<string> {
 
       if (messages.length > 0) {
         const output = messages.join('\n');
-        // Cache for fallback
+        console.log(`[teams] Graph API: ${messages.length} messages`);
         const { writeFile } = await import('fs/promises');
         await writeFile(CACHE_PATH, output, 'utf-8').catch(() => {});
         return output;
+      } else {
+        console.log('[teams] Graph API: no recent messages');
       }
     } catch (err: any) {
-      console.log(`[teams] Graph API failed: ${err.message}`);
+      console.log(`[teams] Graph API failed: ${err.message?.slice(0, 100)} — falling through`);
     }
   }
 

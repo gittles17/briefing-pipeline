@@ -3,6 +3,7 @@ import { promisify } from 'util';
 import { readFile, writeFile, stat } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
+import { graphGet, getUserEmail, isGraphConfigured } from './graph-client';
 
 const exec = promisify(execFile);
 
@@ -114,7 +115,46 @@ function formatEvents(raw: string): string {
 }
 
 export async function fetchICal(): Promise<string> {
-  // Prefer M365 MCP cache (richer data with attendees) — only if fresh
+  // 1. Live Graph API (always fresh, if Azure creds exist)
+  if (isGraphConfigured()) {
+    try {
+      const userEmail = getUserEmail();
+      const now = new Date();
+      const end = new Date(now);
+      end.setDate(end.getDate() + 3);
+
+      const events = await graphGet(`/users/${userEmail}/calendarView`, {
+        'startDateTime': now.toISOString(),
+        'endDateTime': end.toISOString(),
+        '$top': '50',
+        '$select': 'subject,start,end,attendees,location,bodyPreview,isAllDay',
+        '$orderby': 'start/dateTime',
+      });
+
+      const lines: string[] = [];
+      for (const evt of events.value || []) {
+        const start = new Date(evt.start?.dateTime + 'Z');
+        const time = evt.isAllDay ? 'All Day' : start.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+        const date = start.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+        const attendees = (evt.attendees || [])
+          .map((a: any) => a.emailAddress?.name || a.emailAddress?.address)
+          .filter(Boolean)
+          .join(', ');
+        const loc = evt.location?.displayName ? ` @ ${evt.location.displayName}` : '';
+        lines.push(`${date} ${time} — ${evt.subject}${loc}${attendees ? ` [${attendees}]` : ''}`);
+      }
+
+      if (lines.length > 0) {
+        console.log(`[calendar] Graph API: ${events.value?.length} events`);
+        await writeFile(M365_CACHE_PATH, lines.join('\n'), 'utf-8').catch(() => {});
+        return lines.join('\n');
+      }
+    } catch (err: any) {
+      console.log(`[calendar] Graph API failed: ${err.message?.slice(0, 100)} — falling through`);
+    }
+  }
+
+  // 2. Fresh M365 MCP cache (richer data with attendees) — only if fresh
   const m365Fresh = await isFresh(M365_CACHE_PATH, 2);
   if (m365Fresh) {
     try {
@@ -162,7 +202,42 @@ export async function fetchICal(): Promise<string> {
 }
 
 export async function fetchYesterdayCalendar(): Promise<string> {
-  // Try SQLite direct query first
+  // 1. Live Graph API for yesterday's events
+  if (isGraphConfigured()) {
+    try {
+      const userEmail = getUserEmail();
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      yesterday.setHours(0, 0, 0, 0);
+      const yesterdayEnd = new Date(yesterday);
+      yesterdayEnd.setHours(23, 59, 59, 999);
+
+      const events = await graphGet(`/users/${userEmail}/calendarView`, {
+        'startDateTime': yesterday.toISOString(),
+        'endDateTime': yesterdayEnd.toISOString(),
+        '$top': '30',
+        '$select': 'subject,start,end,attendees,location',
+        '$orderby': 'start/dateTime',
+      });
+
+      const lines: string[] = [];
+      for (const evt of events.value || []) {
+        const start = new Date(evt.start?.dateTime + 'Z');
+        const time = start.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+        const attendees = (evt.attendees || []).map((a: any) => a.emailAddress?.name).filter(Boolean).join(', ');
+        lines.push(`${time} — ${evt.subject}${attendees ? ` [${attendees}]` : ''}`);
+      }
+
+      if (lines.length > 0) {
+        console.log(`[calendar] Graph API yesterday: ${events.value?.length} events`);
+        return lines.join('\n');
+      }
+    } catch (err: any) {
+      console.log(`[calendar] Graph API yesterday failed: ${err.message?.slice(0, 100)} — falling through`);
+    }
+  }
+
+  // 2. Try SQLite direct query
   try {
     const query = buildQuery(-1, 0);
     const { stdout } = await exec('sqlite3', ['-separator', '|', DB_PATH, query], { timeout: 10000 });

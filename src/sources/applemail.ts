@@ -2,6 +2,7 @@ import { readFile, stat, writeFile as writeFileFs } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { runOsascript } from '../utils/retry-osascript';
+import { graphGet, getUserEmail, isGraphConfigured } from './graph-client';
 
 const CACHE_PATH = join(homedir(), 'briefing-data', 'email.txt');
 const M365_CACHE_PATH = join(homedir(), 'briefing-data', 'm365-email.txt');
@@ -66,6 +67,57 @@ const KEEP_LIST = [
 ];
 
 export async function fetchAppleMail(hoursBack = 18): Promise<string> {
+  // Try live Graph API first (always fresh, works unattended)
+  if (isGraphConfigured()) {
+    try {
+      const userEmail = getUserEmail();
+      const cutoff = new Date(Date.now() - hoursBack * 3600 * 1000).toISOString();
+
+      // Fetch inbox
+      const inbox = await graphGet(`/users/${userEmail}/messages`, {
+        '$filter': `receivedDateTime ge ${cutoff}`,
+        '$top': '50',
+        '$select': 'subject,sender,bodyPreview,receivedDateTime,importance,hasAttachments',
+        '$orderby': 'receivedDateTime desc',
+      });
+
+      // Fetch sent items (last 72h for cross-referencing)
+      const sentCutoff = new Date(Date.now() - 72 * 3600 * 1000).toISOString();
+      const sent = await graphGet(`/users/${userEmail}/mailFolders/sentItems/messages`, {
+        '$filter': `sentDateTime ge ${sentCutoff}`,
+        '$top': '30',
+        '$select': 'subject,toRecipients,bodyPreview,sentDateTime',
+        '$orderby': 'sentDateTime desc',
+      });
+
+      const lines: string[] = [];
+
+      for (const msg of inbox.value || []) {
+        const sender = msg.sender?.emailAddress;
+        const from = sender ? `${sender.name} <${sender.address}>` : 'Unknown';
+        const imp = msg.importance === 'high' ? ' [HIGH IMPORTANCE]' : '';
+        const attach = msg.hasAttachments ? ' [HAS ATTACHMENTS]' : '';
+        const preview = (msg.bodyPreview || '').replace(/\r?\n/g, ' ').slice(0, 300);
+        lines.push(`[Create] From: ${from} — ${msg.subject}${preview ? ` | ${preview}` : ''}${attach}${imp}`);
+      }
+
+      for (const msg of sent.value || []) {
+        const to = (msg.toRecipients || []).map((r: any) => r.emailAddress?.address).filter(Boolean).join(', ');
+        const preview = (msg.bodyPreview || '').replace(/\r?\n/g, ' ').slice(0, 200);
+        lines.push(`[Create / Sent] From: Jonathan Gitlin — ${msg.subject}${preview ? ` | ${preview}` : ''}`);
+      }
+
+      if (lines.length > 0) {
+        console.log(`[email] Graph API: ${inbox.value?.length || 0} inbox + ${sent.value?.length || 0} sent`);
+        // Write to M365 cache so other sources can cross-reference
+        await writeFileFs(M365_CACHE_PATH, lines.join('\n'), 'utf-8').catch(() => {});
+        return groupEmailThreads(filterEmails(lines.join('\n')));
+      }
+    } catch (err: any) {
+      console.log(`[email] Graph API failed: ${err.message?.slice(0, 100)} — falling through`);
+    }
+  }
+
   // Strategy: use M365 cache ONLY if it's fresh (< 2 hours old).
   // If stale, fall through to Apple Mail which fetches live data.
   // This prevents a stale M365 cache from masking overnight emails.
