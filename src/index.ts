@@ -7,18 +7,24 @@ import { fetchAppleMail } from './sources/applemail';
 import { fetchLuminate } from './sources/luminate';
 import { fetchICal, fetchYesterdayCalendar } from './sources/ical';
 import { fetchNotionProjects } from './sources/notion';
-import { fetchGlossiBoard } from './sources/glossi-board';
 import { fetchIgorForecast } from './sources/igor-forecast';
-import { generateBriefing, getRecurringAlerts, validateAndCondense } from './claude';
-import { sendBriefing } from './deliver';
+import { getRecurringAlerts } from './claude';
+import { generateBriefingMissions } from './claude-missions';
+import { sendBriefing, sendAlertEmail } from './deliver';
 import { fetchFeedback } from './sources/feedback';
 import { fetchClaudeSessions } from './sources/claude-sessions';
 import { fetchTeamsMessages } from './sources/teams';
-import { fetchGlossiCashflow } from './sources/glossi-cashflow';
 import { fetchCollectionsReport } from './sources/collections';
 import { fetchIndustryIntel } from './sources/industry-intel';
+import { fetchReplyEngineStatus } from './sources/reply-engine-status';
+import { fetchAurisStatus } from './sources/auris-status';
+import { getGraphTokenHealth } from './sources/graph-client';
 import { loadRollingContext, archiveBriefing, saveContext } from './context';
 import { loadActionItems, updateActionItems } from './sources/action-items';
+import { trackRuleUsage } from './sources/rule-usage';
+import { processProposalReplies } from './sources/proposal-replies';
+import { getNextProposal, autoApplyExpired } from './sources/proposal';
+import { probeProtectedAccess, evaluateLocalHealth, commitHealthState } from './sources/local-health';
 import { readFile } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -67,6 +73,68 @@ async function refreshContacts(): Promise<void> {
   }
 }
 
+/**
+ * Loads the oldest pending maintenance proposal and renders it as a markdown
+ * section for insertion into the morning briefing prompt.
+ *
+ * Returns an empty string if there are no pending proposals.
+ * Subject format: [maintenance:<id>] approve  /  [maintenance:<id>] keep  /  [maintenance:<id>] drop
+ */
+async function renderPendingProposal(): Promise<string> {
+  try {
+    const proposal = await getNextProposal();
+    if (!proposal) return '';
+
+    const smtpUser = process.env.SMTP_USER ?? '';
+    const id = proposal.id;
+
+    // Build the usage summary from rationale (rationale contains "applied N times in last 30 days")
+    const firingMatch = proposal.rationale.match(/applied (\d+) times? in the last (\d+) days?/i);
+    const firingNote = firingMatch
+      ? `Fired ${firingMatch[1]}x in last ${firingMatch[2]} days.`
+      : '';
+
+    // Determine what kind of proposal this is
+    const ruleList = proposal.ruleIds.join(', ');
+    const typeLabel = proposal.type === 'promote'
+      ? `Promote rule \`${ruleList}\` to hardcoded prompt`
+      : `Merge rules \`${ruleList}\``;
+
+    const summary = `${typeLabel}`;
+
+    // mailto links — subject prefixed with [maintenance:<id>] so reply parser can match
+    const encode = (s: string) => encodeURIComponent(s);
+    const approveSubj = encode(`[maintenance:${id}] approve`);
+    const keepSubj    = encode(`[maintenance:${id}] keep`);
+    const dropSubj    = encode(`[maintenance:${id}] drop`);
+
+    const approveLink = `mailto:${smtpUser}?subject=${approveSubj}&body=${encode('approve')}`;
+    const keepLink    = `mailto:${smtpUser}?subject=${keepSubj}&body=${encode('keep')}`;
+    const dropLink    = `mailto:${smtpUser}?subject=${dropSubj}&body=${encode('drop')}`;
+
+    const lines: string[] = [
+      `## Rule Maintenance`,
+      `- **${summary}** — ${proposal.rationale}${firingNote ? ' ' + firingNote : ''}`,
+      `  Reply: [approve](${approveLink}) / [keep in notes](${keepLink}) / [drop entirely](${dropLink})`,
+    ];
+
+    // Also surface any recent auto-applied/auto-skipped proposals from last 3 days
+    const { getRecentlyApplied } = await import('./sources/proposal');
+    const recentAuto = await getRecentlyApplied(['auto-applied', 'auto-skipped'], 3);
+    for (const entry of recentAuto) {
+      const undoSubj  = encode(`undo [maintenance:${entry.id}]`);
+      const undoLink  = `mailto:${smtpUser}?subject=${undoSubj}&body=${encode('undo')}`;
+      const outcomeLabel = entry.outcome === 'auto-applied' ? 'Auto-applied' : 'Auto-skipped (needs review)';
+      lines.push(`- **${outcomeLabel}:** ${entry.description} — [undo](${undoLink})`);
+    }
+
+    return lines.join('\n');
+  } catch (err: any) {
+    console.log(`[proposal-render] ${err.message}`);
+    return '';
+  }
+}
+
 async function run() {
   const now = new Date();
   const date = now.toLocaleDateString('en-US', {
@@ -76,44 +144,42 @@ async function run() {
 
   console.log(`[briefing] starting — ${date}${isWeekend ? ' (weekend mode)' : ''}`);
 
+  // Process any pending proposal replies Jonathan sent (non-blocking, errors logged)
+  processProposalReplies().catch(err => console.log('[proposal-replies]', err.message));
+
+  // Expire any stale proposals before rendering (so they never surface in briefing)
+  await autoApplyExpired().catch(err => console.log('[proposal-expired]', err.message));
+
   // Refresh contacts for iMessage name resolution
   await refreshContacts();
 
-  // Fetch AppleScript sources sequentially — macOS serializes osascript calls,
-  // so running them in parallel causes each to wait for the others and timeout.
-  // Calendar and Reminders are the slowest (~60-90s each on Mac Studio).
-  console.log('[briefing] fetching calendar...');
-  const calendar = await fetchICal().then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
-
-  console.log('[briefing] fetching yesterday calendar...');
-  const yesterdayCalendar = await fetchYesterdayCalendar().then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
-
-  console.log('[briefing] fetching reminders...');
+  // Reminders and Igor are AppleScript-based and osascript serializes on macOS,
+  // so we keep them sequential. Everything else (Graph API + network calls +
+  // local file reads) runs in one parallel batch.
+  console.log('[briefing] fetching reminders (AppleScript, sequential)...');
   const reminders = await fetchReminders().then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
 
-  console.log('[briefing] fetching apple mail...');
-  const email = await fetchAppleMail().then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
-
-  console.log('[briefing] fetching igor forecast...');
+  console.log('[briefing] fetching igor forecast (AppleScript, sequential)...');
   const igorForecast = await fetchIgorForecast().then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
 
-  console.log('[briefing] fetching luminate...');
-  const luminate = await fetchLuminate().then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
-
-  console.log('[briefing] fetching network sources...');
-  const [imessages, tldr, notionProjects, glossiBoard, feedback, rollingContext, claudeSessions, actionItems, teamsMessages, glossiCashflow, collectionsReport, industryIntel] = await Promise.allSettled([
+  console.log('[briefing] fetching remaining sources in parallel...');
+  const [calendar, yesterdayCalendar, email, luminate, imessages, tldr, notionProjects, feedback, rollingContext, claudeSessions, actionItems, teamsMessages, collectionsReport, industryIntel, replyEngineStatus, aurisStatus] = await Promise.allSettled([
+    fetchICal(),
+    fetchYesterdayCalendar(),
+    fetchAppleMail(),
+    fetchLuminate(),
     fetchIMessages(),
     fetchTLDR(),
     fetchNotionProjects(),
-    fetchGlossiBoard(),
     fetchFeedback(),
     loadRollingContext(),
     fetchClaudeSessions(),
     loadActionItems(),
     fetchTeamsMessages(),
-    fetchGlossiCashflow(),
     fetchCollectionsReport(),
     fetchIndustryIntel(),
+    fetchReplyEngineStatus(),
+    fetchAurisStatus(),
   ]);
 
   const data = {
@@ -126,7 +192,6 @@ async function run() {
     tldr: tldr.status === 'fulfilled' ? tldr.value : '(unavailable)',
     luminate: luminate.status === 'fulfilled' ? luminate.value : '(unavailable)',
     notionProjects: notionProjects.status === 'fulfilled' ? notionProjects.value : '(unavailable)',
-    glossiBoard: glossiBoard.status === 'fulfilled' ? glossiBoard.value : '(unavailable)',
     igorForecast: igorForecast.status === 'fulfilled' ? igorForecast.value : '(unavailable)',
     feedback: feedback.status === 'fulfilled' ? feedback.value : '',
     rollingContext: rollingContext.status === 'fulfilled' ? rollingContext.value : '',
@@ -135,13 +200,64 @@ async function run() {
     staffingSummary: await readFile(`${homedir()}/briefing-data/staffing-summary.txt`, 'utf-8').catch(() => ''),
     actionItems: actionItems.status === 'fulfilled' ? actionItems.value : '',
     teamsMessages: teamsMessages.status === 'fulfilled' ? teamsMessages.value : '',
-    glossiCashflow: glossiCashflow.status === 'fulfilled' ? glossiCashflow.value : '',
     collectionsReport: collectionsReport.status === 'fulfilled' ? collectionsReport.value : '',
     industryIntel: industryIntel.status === 'fulfilled' ? industryIntel.value : '',
+    replyEngineStatus: replyEngineStatus.status === 'fulfilled' ? replyEngineStatus.value : '',
+    aurisStatus: aurisStatus.status === 'fulfilled' ? aurisStatus.value : '',
+    graphTokenHealth: await getGraphTokenHealth().catch(() => ''),
   };
 
-  console.log('[briefing] sources fetched — generating briefing with Opus');
-  const { body: briefing, subject } = await generateBriefing(data, isWeekend);
+  // Rule maintenance proposals are NOT surfaced in the daily brief anymore —
+  // Jonathan didn't want the noise at the top. They still accumulate in
+  // ~/briefing-data/maintenance-proposal.md and the 14-day auto-apply logic
+  // still runs in the background.
+  const pendingProposal = '';
+
+  // Local-health: probe TCC-protected stores, surface a banner in the System
+  // Alert slot, alert on state transitions, then persist state. Fully
+  // fault-isolated — any error here must NEVER break the briefing run.
+  try {
+    const probe = await probeProtectedAccess();
+    const health = await evaluateLocalHealth(probe, {
+      reminders: data.reminders,
+      imessage: data.imessages,
+      calendar: data.calendar,
+    });
+
+    if (health.banner) {
+      data.graphTokenHealth = [data.graphTokenHealth, health.banner].filter(Boolean).join('\n\n');
+    }
+
+    if (health.transitions.length) {
+      const broke = health.transitions.filter(t => t.kind === 'broke').map(t => t.source);
+      const recovered = health.transitions.filter(t => t.kind === 'recovered').map(t => t.source);
+      let subject: string;
+      if (broke.length && recovered.length) {
+        subject = '⚠️ Briefing data source change';
+      } else if (broke.length) {
+        subject = `🛑 Briefing data source down: ${broke.join(', ')}`;
+      } else {
+        subject = `✅ Briefing data source recovered: ${recovered.join(', ')}`;
+      }
+
+      const bodyLines = [
+        ...health.transitions.map(t => `- ${t.source}: ${t.kind}`),
+        '',
+        health.banner,
+        '',
+        'Remediation: grant Full Disk Access to /bin/bash in System Settings → Privacy & Security, then run `npm run check-access`.',
+      ];
+
+      await sendAlertEmail(subject, bodyLines.join('\n'));
+    }
+
+    await commitHealthState(health.degraded);
+  } catch (err: any) {
+    console.log(`[local-health] wiring error: ${err?.message || 'unknown'}`);
+  }
+
+  console.log('[briefing] sources fetched — generating briefing with Missions pipeline');
+  const { body: briefing, subject } = await generateBriefingMissions({ ...data, pendingProposal }, isWeekend);
 
   const wordCount = briefing.split(/\s+/).length;
   console.log(`[briefing] briefing validated and condensed — ${wordCount} words — sending email`);
@@ -153,6 +269,7 @@ async function run() {
     archiveBriefing(briefing, date),
     saveContext(briefing),
     updateActionItems(briefing, data.email, data.reminders),
+    trackRuleUsage(briefing, 'morning').catch(err => console.log('[rule-usage]', err.message)),
   ]);
 
   console.log('[briefing] done');
