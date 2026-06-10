@@ -20,7 +20,7 @@
  * [local-health] prefix so any fallback path is visible.
  */
 
-import { readdir, access, readFile, writeFile } from 'fs/promises';
+import { readdir, access, readFile, writeFile, stat } from 'fs/promises';
 import { constants as fsConstants } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -81,6 +81,40 @@ const CALENDAR_DB = join(
 
 const STATE_PATH = join(homedir(), 'briefing-data', 'source-health.json');
 
+// Staged copies written by stage-protected.sh (sourced by the launchd bash
+// wrapper right before the pipeline starts). Under launchd, node's direct
+// reads of the protected originals are TCC-denied (stale per-binary deny on
+// the node binary overrides the /bin/bash FDA grant), but the pipeline works
+// off these staged copies — so a FRESH staged copy means the source is
+// functionally healthy even when the direct probe is denied.
+const STAGING_DIR = join(homedir(), 'briefing-data', 'staging');
+const STAGED_REMINDERS_DIR = join(STAGING_DIR, 'reminders-stores');
+const STAGING_MAX_AGE_MS = 30 * 60 * 1000;
+
+/** True if `path` exists and was modified within the staging freshness window. */
+async function isFreshStaged(path: string): Promise<boolean> {
+  try {
+    const s = await stat(path);
+    return Date.now() - s.mtimeMs <= STAGING_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+
+/** True if the staged reminders dir holds at least one fresh .sqlite store. */
+async function hasFreshStagedReminders(): Promise<boolean> {
+  try {
+    const files = await readdir(STAGED_REMINDERS_DIR);
+    for (const f of files) {
+      if (!f.endsWith('.sqlite')) continue;
+      if (await isFreshStaged(join(STAGED_REMINDERS_DIR, f))) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Probe read access to each protected store IN THE CURRENT PROCESS CONTEXT.
  * Never throws — any failure maps to 'denied'.
@@ -94,13 +128,17 @@ export async function probeProtectedAccess(): Promise<ProbeResult> {
   return { reminders, imessage, calendar };
 }
 
-/** Reminders: attempt to list the Stores dir. EPERM/throw => denied. */
+/** Reminders: direct listing of the Stores dir, else a fresh staged copy. */
 async function probeReminders(): Promise<AccessState> {
   try {
     // Success OR empty listing both mean we have read access to the dir.
     await readdir(REMINDERS_STORE_DIR);
     return 'ok';
   } catch (err: any) {
+    if (await hasFreshStagedReminders()) {
+      console.log('[local-health] reminders: direct read denied, fresh staged copy present — ok');
+      return 'ok';
+    }
     console.log(
       `[local-health] reminders probe denied: ${err?.code || err?.message?.slice(0, 60) || 'unknown'}`,
     );
@@ -108,12 +146,16 @@ async function probeReminders(): Promise<AccessState> {
   }
 }
 
-/** iMessage: fs.access(R_OK) on chat.db. EPERM (incl. ENOENT-with-EPERM) => denied. */
+/** iMessage: direct fs.access(R_OK) on chat.db, else a fresh staged copy. */
 async function probeImessage(): Promise<AccessState> {
   try {
     await access(IMESSAGE_DB, fsConstants.R_OK);
     return 'ok';
   } catch (err: any) {
+    if (await isFreshStaged(join(STAGING_DIR, 'chat.db'))) {
+      console.log('[local-health] imessage: direct read denied, fresh staged copy present — ok');
+      return 'ok';
+    }
     console.log(
       `[local-health] imessage probe denied: ${err?.code || err?.message?.slice(0, 60) || 'unknown'}`,
     );
@@ -121,12 +163,16 @@ async function probeImessage(): Promise<AccessState> {
   }
 }
 
-/** Calendar: fs.access(R_OK) on local Calendar.sqlitedb. EPERM => denied. */
+/** Calendar: direct fs.access(R_OK) on Calendar.sqlitedb, else a fresh staged copy. */
 async function probeCalendar(): Promise<AccessState> {
   try {
     await access(CALENDAR_DB, fsConstants.R_OK);
     return 'ok';
   } catch (err: any) {
+    if (await isFreshStaged(join(STAGING_DIR, 'Calendar.sqlitedb'))) {
+      console.log('[local-health] calendar: direct read denied, fresh staged copy present — ok');
+      return 'ok';
+    }
     console.log(
       `[local-health] calendar probe denied: ${err?.code || err?.message?.slice(0, 60) || 'unknown'}`,
     );

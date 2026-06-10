@@ -48,6 +48,12 @@ Without FDA, **Reminders and iMessage drop out** and **Calendar loses its local 
 
 System Settings → Privacy & Security → Full Disk Access → **+** → add **/bin/bash** (use **Cmd+Shift+G** to navigate to `/bin/bash`). The launchd jobs invoke `/bin/bash -c "..."`, so the grant target is the shell, not node/tsx. Granting to `/bin/bash` is **stable across `brew upgrade node`** (the node binary path changes on upgrade; `/bin/bash` does not).
 
+### Why bash stages copies for node (the 2026-06-10 discovery)
+
+Granting FDA to `/bin/bash` alone was NOT enough: the node binary carries a stale **per-binary TCC DENY** (added 2026-04-04, visible as "node" toggled off in the FDA pane) that **overrides** the bash allow for node *and everything node spawns* (even `/bin/cp` run from node is denied). Empirically verified via launchd probe jobs: `bash → ls` on a protected dir = OK; `bash → node fs.readdir` = DENIED; `bash → node → cp` = DENIED.
+
+Fix: **`stage-protected.sh`** (repo root) is *sourced* by both launchd wrappers before `npx tsx` runs. Bash (FDA-granted) copies chat.db, Calendar.sqlitedb, and the Reminders stores (+ WAL/SHM sidecars) into `~/briefing-data/staging/`; the TS sources prefer a fresh (<30 min) staged copy and fall back to the protected originals (which work in interactive contexts). The local-health probe counts a fresh staged copy as healthy. Node never touches a protected path on scheduled runs — immune to `brew upgrade node` and stale TCC rows. Optional cleanup: removing the "node" (and "sqlite3") DENIED entries from the FDA pane is harmless but no longer required.
+
 ### Verify
 
 Run `npm run check-access`. Note: it probes the **current shell context**, which usually already has FDA — so it can show all ✅ even while the scheduled launchd job is still denied. The real confirmation is the **next briefing run**: if the 🛑 banner (and the alert email) clears, the grant worked.

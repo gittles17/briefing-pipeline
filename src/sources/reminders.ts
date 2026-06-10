@@ -34,17 +34,25 @@ const STORE_DIR = join(
   'Stores',
 );
 
-/** Pick the largest active reminders store (typically the iCloud one). */
-async function findActiveDb(): Promise<string | null> {
+// Staged copies written by stage-protected.sh (sourced by the launchd bash
+// wrapper right before the pipeline). Under launchd, node cannot read the
+// protected Stores dir directly — a stale per-binary TCC deny on node
+// overrides the /bin/bash FDA grant — so bash stages copies and we read those.
+const STAGED_STORE_DIR = join(homedir(), 'briefing-data', 'staging', 'reminders-stores');
+const STAGING_MAX_AGE_MS = 30 * 60 * 1000;
+
+/** Largest .sqlite in a dir; when maxAgeMs is set, only files modified within it. */
+async function pickLargestSqlite(dir: string, maxAgeMs: number | null): Promise<string | null> {
   try {
-    const files = await readdir(STORE_DIR);
+    const files = await readdir(dir);
     const candidates = files.filter(f => f.endsWith('.sqlite'));
     if (candidates.length === 0) return null;
     let best: { path: string; size: number } | null = null;
     for (const f of candidates) {
-      const p = join(STORE_DIR, f);
+      const p = join(dir, f);
       try {
         const s = await stat(p);
+        if (maxAgeMs !== null && Date.now() - s.mtimeMs > maxAgeMs) continue;
         if (!best || s.size > best.size) best = { path: p, size: s.size };
       } catch {}
     }
@@ -52,6 +60,18 @@ async function findActiveDb(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/** Pick the largest active reminders store (typically the iCloud one). */
+async function findActiveDb(): Promise<string | null> {
+  // Fresh staged copy first (scheduled runs), then the protected original
+  // (interactive contexts have their own FDA and read it directly).
+  const staged = await pickLargestSqlite(STAGED_STORE_DIR, STAGING_MAX_AGE_MS);
+  if (staged) {
+    console.log('[reminders] using staged store copy');
+    return staged;
+  }
+  return pickLargestSqlite(STORE_DIR, null);
 }
 
 /** Run the SQL query against the Reminders DB. Returns formatted text or null. */
