@@ -25,7 +25,9 @@ import { trackRuleUsage } from './sources/rule-usage';
 import { processProposalReplies } from './sources/proposal-replies';
 import { getNextProposal, autoApplyExpired } from './sources/proposal';
 import { probeProtectedAccess, evaluateLocalHealth, commitHealthState } from './sources/local-health';
-import { readFile } from 'fs/promises';
+import { runSelfHeal, type SelfHealReport } from './sources/self-heal';
+import { withTimeout } from './utils/with-timeout';
+import { readFile, writeFile } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
@@ -144,6 +146,17 @@ async function run() {
 
   console.log(`[briefing] starting — ${date}${isWeekend ? ' (weekend mode)' : ''}`);
 
+  // SELF-HEAL: repair the environment BEFORE anything is fetched (rebuild a
+  // Node-ABI-mismatched better-sqlite3, clear stale locks, prune temp dirs,
+  // repair a corrupt graph token, re-stage protected DBs). Fully fault-isolated.
+  // The report feeds the health alert so we only escalate what heal couldn't fix.
+  let healReport: SelfHealReport | null = null;
+  try {
+    healReport = await runSelfHeal();
+  } catch (err: any) {
+    console.log(`[self-heal] wiring error: ${err?.message || 'unknown'}`);
+  }
+
   // Process any pending proposal replies Jonathan sent (non-blocking, errors logged)
   processProposalReplies().catch(err => console.log('[proposal-replies]', err.message));
 
@@ -157,29 +170,29 @@ async function run() {
   // so we keep them sequential. Everything else (Graph API + network calls +
   // local file reads) runs in one parallel batch.
   console.log('[briefing] fetching reminders (AppleScript, sequential)...');
-  const reminders = await fetchReminders().then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
+  const reminders = await withTimeout(fetchReminders(), 120000, 'reminders').then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
 
   console.log('[briefing] fetching igor forecast (AppleScript, sequential)...');
-  const igorForecast = await fetchIgorForecast().then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
+  const igorForecast = await withTimeout(fetchIgorForecast(), 120000, 'igor-forecast').then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
 
   console.log('[briefing] fetching remaining sources in parallel...');
   const [calendar, yesterdayCalendar, email, luminate, imessages, tldr, notionProjects, feedback, rollingContext, claudeSessions, actionItems, teamsMessages, collectionsReport, industryIntel, replyEngineStatus, aurisStatus] = await Promise.allSettled([
-    fetchICal(),
-    fetchYesterdayCalendar(),
-    fetchAppleMail(),
-    fetchLuminate(),
-    fetchIMessages(),
-    fetchTLDR(),
-    fetchNotionProjects(),
-    fetchFeedback(),
-    loadRollingContext(),
-    fetchClaudeSessions(),
-    loadActionItems(),
-    fetchTeamsMessages(),
-    fetchCollectionsReport(),
-    fetchIndustryIntel(),
-    fetchReplyEngineStatus(),
-    fetchAurisStatus(),
+    withTimeout(fetchICal(), 120000, 'calendar'),
+    withTimeout(fetchYesterdayCalendar(), 120000, 'yesterday-calendar'),
+    withTimeout(fetchAppleMail(), 120000, 'applemail'),
+    withTimeout(fetchLuminate(), 120000, 'luminate'),
+    withTimeout(fetchIMessages(), 120000, 'imessage'),
+    withTimeout(fetchTLDR(), 120000, 'tldr'),
+    withTimeout(fetchNotionProjects(), 120000, 'notion'),
+    withTimeout(fetchFeedback(), 90000, 'feedback'),
+    withTimeout(loadRollingContext(), 60000, 'rolling-context'),
+    withTimeout(fetchClaudeSessions(), 60000, 'claude-sessions'),
+    withTimeout(loadActionItems(), 60000, 'action-items'),
+    withTimeout(fetchTeamsMessages(), 120000, 'teams'),
+    withTimeout(fetchCollectionsReport(), 120000, 'collections'),
+    withTimeout(fetchIndustryIntel(), 120000, 'industry-intel'),
+    withTimeout(fetchReplyEngineStatus(), 60000, 'reply-engine'),
+    withTimeout(fetchAurisStatus(), 120000, 'auris'),
   ]);
 
   const data = {
@@ -244,9 +257,23 @@ async function run() {
         ...health.transitions.map(t => `- ${t.source}: ${t.kind}`),
         '',
         health.banner,
-        '',
-        'Remediation: grant Full Disk Access to /bin/bash in System Settings → Privacy & Security, then run `npm run check-access`.',
       ];
+
+      // Include what self-heal automatically attempted this run, so the alert
+      // names the real cause instead of blanket-blaming FDA. If self-heal fixed
+      // the ABI issue, the fetches already recovered and this alert won't fire.
+      if (healReport) {
+        bodyLines.push('', 'Auto-heal this run:');
+        for (const a of healReport.actions) {
+          const mark = a.outcome === 'healed' ? '✓ fixed' : a.outcome === 'failed' ? '✗ could not fix' : '· ok';
+          bodyLines.push(`  ${mark} — ${a.detail}${a.note ? ` (${a.note})` : ''}`);
+        }
+      }
+
+      bodyLines.push(
+        '',
+        'If a source is STILL down after auto-heal, the likely cause is Full Disk Access revoked for the scheduled job — grant it to /bin/bash in System Settings → Privacy & Security, then run `npm run check-access`. (macOS blocks scripting this grant, so it is the one thing auto-heal cannot do.)',
+      );
 
       await sendAlertEmail(subject, bodyLines.join('\n'));
     }
@@ -260,8 +287,18 @@ async function run() {
   const { body: briefing, subject } = await generateBriefingMissions({ ...data, pendingProposal }, isWeekend);
 
   const wordCount = briefing.split(/\s+/).length;
-  console.log(`[briefing] briefing validated and condensed — ${wordCount} words — sending email`);
-  await sendBriefing(briefing, date, subject, isWeekend);
+  // SKIP_SEND: verify the full pipeline (fetch → workers → assembler → validator)
+  // completes and produces real content, WITHOUT delivering an email. Used for
+  // testing the pipeline end-to-end. The rendered brief is written to disk so it
+  // can be inspected.
+  if (process.env.SKIP_SEND) {
+    const outPath = `${homedir()}/briefing-data/_test-brief.md`;
+    await writeFile(outPath, `# ${subject}\n\n${briefing}`, 'utf-8');
+    console.log(`[briefing] SKIP_SEND set — ${wordCount} words — NOT sending. Wrote ${outPath}`);
+  } else {
+    console.log(`[briefing] briefing validated and condensed — ${wordCount} words — sending email`);
+    await sendBriefing(briefing, date, subject, isWeekend);
+  }
 
   // Archive and extract context for tomorrow (non-blocking)
   console.log('[briefing] saving context');

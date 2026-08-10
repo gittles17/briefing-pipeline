@@ -18,6 +18,8 @@ import { loadRollingContext } from './context';
 import { loadActionItems } from './sources/action-items';
 import { trackRuleUsage } from './sources/rule-usage';
 import { probeProtectedAccess, evaluateLocalHealth, commitHealthState } from './sources/local-health';
+import { runSelfHeal } from './sources/self-heal';
+import { withTimeout } from './utils/with-timeout';
 import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 
@@ -36,6 +38,10 @@ async function run() {
 
   console.log(`[afternoon] starting — ${date}`);
 
+  // SELF-HEAL pre-flight (same as morning): repair the environment before any
+  // fetch runs. Fault-isolated — never breaks the sync.
+  await runSelfHeal().catch(err => console.log('[self-heal] wiring error:', err?.message || 'unknown'));
+
   // Reminders is AppleScript-based (cache-first but may fall through) — run
   // sequentially first to avoid osascript contention. Everything else (Graph
   // API + network + local) runs in one parallel batch.
@@ -44,17 +50,17 @@ async function run() {
 
   console.log('[afternoon] fetching remaining sources in parallel...');
   const [calendar, email, imessages, notionProjects, rollingContext, actionItems, teamsMessages, industryIntel, feedback, replyEngineStatus, aurisStatus] = await Promise.allSettled([
-    fetchICal(),
-    fetchAppleMail(),
-    fetchIMessages(8),  // Only last 8 hours for afternoon
-    fetchNotionProjects(),
-    loadRollingContext(),
-    loadActionItems(),
-    fetchTeamsMessages(),
-    fetchIndustryIntel(),
-    fetchFeedback(),
-    fetchReplyEngineStatus(),
-    fetchAurisStatus(),
+    withTimeout(fetchICal(), 120000, 'calendar'),
+    withTimeout(fetchAppleMail(), 120000, 'applemail'),
+    withTimeout(fetchIMessages(8), 120000, 'imessage'),  // Only last 8 hours for afternoon
+    withTimeout(fetchNotionProjects(), 120000, 'notion'),
+    withTimeout(loadRollingContext(), 60000, 'rolling-context'),
+    withTimeout(loadActionItems(), 60000, 'action-items'),
+    withTimeout(fetchTeamsMessages(), 120000, 'teams'),
+    withTimeout(fetchIndustryIntel(), 120000, 'industry-intel'),
+    withTimeout(fetchFeedback(), 90000, 'feedback'),
+    withTimeout(fetchReplyEngineStatus(), 60000, 'reply-engine'),
+    withTimeout(fetchAurisStatus(), 120000, 'auris'),
   ]);
 
   // Load this morning's briefing for context

@@ -40,7 +40,7 @@ export async function saveContext(briefing: string): Promise<void> {
   const dateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
   const message = await getClient().messages.create({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-haiku-4-5', // tiny context-extraction call
     max_tokens: 500,
     messages: [{
       role: 'user',
