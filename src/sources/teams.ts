@@ -40,14 +40,22 @@ export async function fetchTeamsMessages(): Promise<string> {
   if (isGraphConfigured()) {
     try {
       const userEmail = getUserEmail();
-      const cutoff = new Date(Date.now() - 18 * 3600 * 1000);
+      // Smart lookback: 48h on weekdays, 72h on weekends/Mondays (to catch Friday messages)
+      const dayOfWeek = new Date().getDay(); // 0=Sun, 1=Mon, 6=Sat
+      const lookbackHours = (dayOfWeek === 0 || dayOfWeek === 1 || dayOfWeek === 6) ? 72 : 48;
+      const cutoff = new Date(Date.now() - lookbackHours * 3600 * 1000);
+      console.log(`[teams] lookback: ${lookbackHours}h (day=${dayOfWeek}), cutoff=${cutoff.toISOString()}`);
 
-      const chats = await graphGet(`/users/${userEmail}/chats`, { '$top': '20' });
+      const chats = await graphGet(`/me/chats`, {
+        '$top': '30',
+        '$orderby': 'lastMessagePreview/createdDateTime desc',
+      });
       const messages: string[] = [];
 
       for (const chat of chats?.value || []) {
         try {
-          const chatMessages = await graphGet(`/users/${userEmail}/chats/${chat.id}/messages`, { '$top': '10' });
+          const chatTopic = chat.topic || ''; // group chats have a topic; 1:1 chats don't
+          const chatMessages = await graphGet(`/me/chats/${chat.id}/messages`, { '$top': '15' });
 
           for (const msg of chatMessages?.value || []) {
             if (msg.body?.content && msg.from?.user?.displayName) {
@@ -57,7 +65,8 @@ export async function fetchTeamsMessages(): Promise<string> {
               if (text.length > 5) {
                 const name = msg.from.user.displayName;
                 const time = created.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-                messages.push(`[${time}] ${name}: ${text.slice(0, 300)}`);
+                const prefix = chatTopic ? `${chatTopic} | ${time}` : time;
+                messages.push(`[${prefix}] ${name}: ${text.slice(0, 300)}`);
               }
             }
           }

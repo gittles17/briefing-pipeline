@@ -2,8 +2,11 @@
   "name": "morning-briefing",
   "version": "1.0.0",
   "scripts": {
-    "start": "ts-node src/index.ts",
-    "dev": "ts-node src/index.ts"
+    "start": "tsx src/index.ts",
+    "dev": "tsx src/index.ts",
+    "check-access": "tsx src/check-access.ts",
+    "heal": "tsx src/heal.ts",
+    "reauth": "tsx src/reauth.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.85.0",

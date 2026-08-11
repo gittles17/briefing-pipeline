@@ -6,6 +6,7 @@ function getTransporter() {
     _transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
       port: 587,
+      family: 4, // Force IPv4 — IPv6 to Gmail SMTP is unreliable
       auth: {
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS,
@@ -134,6 +135,24 @@ function markdownToHtml(md: string): string {
     // Regular paragraph
     return `<p style="margin: 8px 0; color: ${C.text2}; line-height: 1.7; font-size: 15px;">${line}</p>`;
   }).join('\n');
+}
+
+/**
+ * Send a plain-text alert email (e.g. a data-source health change). Reuses the
+ * shared transporter. Fault-isolated: any send failure is logged with the
+ * [alert] prefix and swallowed — this NEVER throws out to the caller.
+ */
+export async function sendAlertEmail(subject: string, body: string): Promise<void> {
+  try {
+    await getTransporter().sendMail({
+      from: process.env.SMTP_USER,
+      to: process.env.RECIPIENT_EMAIL || process.env.SMTP_USER,
+      subject,
+      text: body,
+    });
+  } catch (err: any) {
+    console.log(`[alert] failed to send alert email: ${err?.message || 'unknown'}`);
+  }
 }
 
 export async function sendBriefing(briefingText: string, date: string, subject?: string, isWeekend: boolean = false, mode: 'morning' | 'afternoon' = 'morning') {

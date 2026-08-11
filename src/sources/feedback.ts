@@ -2,8 +2,31 @@ import { readFile, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { runOsascript } from '../utils/retry-osascript';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileP = promisify(execFile);
 
 const FEEDBACK_PATH = join(homedir(), 'briefing-data', 'feedback.json');
+const NOTES_PATH = join(homedir(), 'briefing-data', 'briefing-notes.md');
+
+/**
+ * Is Apple Mail actually running? If not, we must NOT `tell application "Mail"`
+ * — that would LAUNCH Mail under launchd and can hang for minutes. Cheap 5s probe
+ * via System Events; on any error assume not running and skip the scan.
+ */
+async function isMailRunning(): Promise<boolean> {
+  try {
+    const { stdout } = await execFileP(
+      'osascript',
+      ['-e', 'tell application "System Events" to (name of processes) contains "Mail"'],
+      { timeout: 5000 },
+    );
+    return stdout.trim() === 'true';
+  } catch {
+    return false;
+  }
+}
 
 interface FeedbackEntry {
   date: string;
@@ -58,6 +81,10 @@ tell application "Mail"
 end tell`;
 
   try {
+    if (!(await isMailRunning())) {
+      console.log('[feedback] Mail not running — skipping scan, using cached feedback');
+      throw new Error('mail-not-running');  // caught below → falls through to cached notes
+    }
     const scriptPath = join(homedir(), 'briefing-data', 'feedback.applescript');
     await writeFile(scriptPath, script, 'utf-8');
     const stdout = await runOsascript(scriptPath);
@@ -90,13 +117,24 @@ end tell`;
     await writeFile(FEEDBACK_PATH, JSON.stringify(existing, null, 2), 'utf-8');
   } catch {}
 
-  if (existing.length === 0) return '';
+  // Load persistent structural notes (always prepended — these are Jonathan's hard rules)
+  let persistentNotes = '';
+  try {
+    persistentNotes = (await readFile(NOTES_PATH, 'utf-8')).trim();
+  } catch {}
+
+  if (existing.length === 0 && !persistentNotes) return '';
 
   // Format for the prompt
   const positive = existing.filter(e => e.type === 'positive');
   const negative = existing.filter(e => e.type === 'negative');
 
   const lines: string[] = [];
+  if (persistentNotes) {
+    lines.push('PERSISTENT RULES & CORRECTIONS (follow these every time):');
+    lines.push(persistentNotes);
+    lines.push('');
+  }
   if (positive.length > 0) {
     lines.push('LIKED:');
     for (const f of positive.slice(-15)) {

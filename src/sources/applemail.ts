@@ -73,17 +73,32 @@ export async function fetchAppleMail(hoursBack = 18): Promise<string> {
       const userEmail = getUserEmail();
       const cutoff = new Date(Date.now() - hoursBack * 3600 * 1000).toISOString();
 
-      // Fetch inbox
-      const inbox = await graphGet(`/users/${userEmail}/messages`, {
+      // Fetch inbox messages within the time window
+      const inbox = await graphGet(`/me/mailFolders/inbox/messages`, {
         '$filter': `receivedDateTime ge ${cutoff}`,
         '$top': '50',
         '$select': 'subject,sender,bodyPreview,receivedDateTime,importance,hasAttachments',
         '$orderby': 'receivedDateTime desc',
       });
 
+      // Also fetch from Archive — emails Jonathan already read/replied to get moved here.
+      // The receivedDateTime filter prevents old emails (like 6-month-old Clio threads) from leaking in.
+      let archived: any = { value: [] };
+      try {
+        archived = await graphGet(`/me/mailFolders/archive/messages`, {
+          '$filter': `receivedDateTime ge ${cutoff}`,
+          '$top': '30',
+          '$select': 'subject,sender,bodyPreview,receivedDateTime,importance,hasAttachments',
+          '$orderby': 'receivedDateTime desc',
+        });
+      } catch (err: any) {
+        // Archive folder may not exist or may have a different name — non-fatal
+        console.log(`[email] Archive folder fetch failed (non-fatal): ${err.message?.slice(0, 80)}`);
+      }
+
       // Fetch sent items (last 72h for cross-referencing)
       const sentCutoff = new Date(Date.now() - 72 * 3600 * 1000).toISOString();
-      const sent = await graphGet(`/users/${userEmail}/mailFolders/sentItems/messages`, {
+      const sent = await graphGet(`/me/mailFolders/sentItems/messages`, {
         '$filter': `sentDateTime ge ${sentCutoff}`,
         '$top': '30',
         '$select': 'subject,toRecipients,bodyPreview,sentDateTime',
@@ -91,24 +106,42 @@ export async function fetchAppleMail(hoursBack = 18): Promise<string> {
       });
 
       const lines: string[] = [];
+      const seenIds = new Set<string>(); // dedup across folders
 
-      for (const msg of inbox.value || []) {
+      // Helper to format an incoming email line
+      function formatIncoming(msg: any, folder?: string): string | null {
+        const key = `${msg.subject}|${msg.sender?.emailAddress?.address}|${msg.receivedDateTime}`;
+        if (seenIds.has(key)) return null;
+        seenIds.add(key);
         const sender = msg.sender?.emailAddress;
         const from = sender ? `${sender.name} <${sender.address}>` : 'Unknown';
         const imp = msg.importance === 'high' ? ' [HIGH IMPORTANCE]' : '';
         const attach = msg.hasAttachments ? ' [HAS ATTACHMENTS]' : '';
         const preview = (msg.bodyPreview || '').replace(/\r?\n/g, ' ').slice(0, 300);
-        lines.push(`[Create] From: ${from} — ${msg.subject}${preview ? ` | ${preview}` : ''}${attach}${imp}`);
+        const date = msg.receivedDateTime ? ` (${new Date(msg.receivedDateTime).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })})` : '';
+        const folderTag = folder ? ` [${folder}]` : '';
+        return `[Create]${date} From: ${from} — ${msg.subject}${preview ? ` | ${preview}` : ''}${attach}${imp}${folderTag}`;
+      }
+
+      for (const msg of inbox.value || []) {
+        const line = formatIncoming(msg);
+        if (line) lines.push(line);
+      }
+
+      for (const msg of archived.value || []) {
+        const line = formatIncoming(msg, 'read/archived');
+        if (line) lines.push(line);
       }
 
       for (const msg of sent.value || []) {
         const to = (msg.toRecipients || []).map((r: any) => r.emailAddress?.address).filter(Boolean).join(', ');
         const preview = (msg.bodyPreview || '').replace(/\r?\n/g, ' ').slice(0, 200);
-        lines.push(`[Create / Sent] From: Jonathan Gitlin — ${msg.subject}${preview ? ` | ${preview}` : ''}`);
+        const date = msg.sentDateTime ? ` (${new Date(msg.sentDateTime).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })})` : '';
+        lines.push(`[Create / Sent]${date} From: Jonathan Gitlin — ${msg.subject}${preview ? ` | ${preview}` : ''}`);
       }
 
       if (lines.length > 0) {
-        console.log(`[email] Graph API: ${inbox.value?.length || 0} inbox + ${sent.value?.length || 0} sent`);
+        console.log(`[email] Graph API: ${inbox.value?.length || 0} inbox + ${archived.value?.length || 0} archived + ${sent.value?.length || 0} sent`);
         // Write to M365 cache so other sources can cross-reference
         await writeFileFs(M365_CACHE_PATH, lines.join('\n'), 'utf-8').catch(() => {});
         return groupEmailThreads(filterEmails(lines.join('\n')));
