@@ -437,7 +437,7 @@ CRITICAL — KNOWN DATE CORRECTIONS (defense-in-depth on top of the reminders-au
 - IRS short-term payment plan ($20K) has been SUBMITTED — Jonathan is waiting on IRS to revise. Do NOT flag it as "overdue". The payment schedule from reminders is: 5/15 pay $10K toward extension balance; 6/15 pay final $10K extension + $40K Q1 estimate ($50K total). Surface these on their due dates only — don't compound them or treat the 4/16 plan setup as an open action.
 
 CRITICAL — CASH POSITION (when Maya's collections data is present):
-- The "Early-pull candidates (MTD collected)" line MUST appear whenever cash position is in the brief. Do NOT drop it for brevity. Both Apple AND Disney must appear even if one is $0.
+- The "Early-pull candidates (MTD collected)" line MUST appear whenever cash position is in the brief, reproduced with Maya's exact line label — do NOT reword it to "Early-pull available", do NOT append "= $X if needed" or a combined sum, do NOT drop it for brevity. Both Apple AND Disney must appear even if one is $0.
 - Use Maya's exact labels VERBATIM: "Apple TV+" (NOT "Apple", NOT "Apple TV") and "Walt Disney" (NOT "Disney", NOT "Disney+"). Those are the row labels from her Detail by Studio section.
 - Quote the figures from the source — do NOT round, do NOT combine the two studios into a single sum without showing both component figures.
 - These two studios get a dedicated line because Jonathan can request early payment from them specifically; other studios go into the generic "Top MTD" line.
@@ -560,7 +560,7 @@ ATTRIBUTION: Never assign a person/group name to a revenue figure unless that ex
 If Maya's collections report data is available, show it in this exact format (4 lines max):
 - **Liquid: $[X]K** — covers/short next payroll (~$450K) with $[Y]K buffer (or ⚠️ short ~$[Y]K)
 - **MTD Collections: $[X]K** | **AR Outstanding: $[X]K**
-- Early-pull available: Apple TV+ ($[X]K) + Walt Disney ($[X]K) = $[X]K if needed (use the exact labels "Apple TV+" and "Walt Disney" — never "Apple" or "Disney" alone)
+- Early-pull candidates (MTD collected): Apple TV+ ($[X]K) · Walt Disney ($[X]K) — reproduce Maya's line label VERBATIM; do NOT reword to "Early-pull available" and do NOT append "= $X if needed" or a combined sum; show BOTH studios even if one is $0; use the exact labels "Apple TV+" and "Walt Disney" (never "Apple" or "Disney" alone)
 - Today's collections: [who paid, amounts] — flag big days (over $100K) with 📈
 If no collections data, skip this section entirely.
 
@@ -717,7 +717,7 @@ VALIDATION CHECKLIST — apply each check to every item in the draft:
 
 13. **ROUTINE HIRE/ONBOARDING CHECK**: Remove any bullet about routine HR paperwork, NDA routing, department-head hire approvals, form signatures, or vendor onboarding unless Jonathan is the explicit signer or it's a material strategic deal. Items framed as "pending your sign-off" for a Pfister/Primm hire are wrong — they own those decisions.
 
-14. **CASH POSITION LABEL CHECK**: If cash position is in the briefing, the early-pull line MUST use the labels "Apple TV+" and "Walt Disney" (Maya's verbatim Detail-by-Studio row labels) — NEVER "Apple" alone, "Apple TV" without the plus, or "Disney" alone. Both studios must appear (even if one is $0). If the early-pull line is missing entirely while other cash data is present, ADD it from the source.
+14. **CASH POSITION LABEL CHECK**: If cash position is in the briefing, the early-pull line MUST use Maya's verbatim line label "Early-pull candidates (MTD collected):" — NOT "Early-pull available", and with NO appended "= $X if needed" or combined sum. It MUST use the studio labels "Apple TV+" and "Walt Disney" (Maya's verbatim Detail-by-Studio row labels) — NEVER "Apple" alone, "Apple TV" without the plus, or "Disney" alone. Both studios must appear (even if one is $0). If the line is reworded, fix it to the verbatim label; if it is missing entirely while other cash data is present, ADD it from the source.
 
 15. **COMPLETENESS CHECK**:
    a. For EACH meeting on today's calendar, verify it appears in the briefing. If a meeting is missing, ADD it.

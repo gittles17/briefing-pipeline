@@ -36,6 +36,20 @@ const PROPOSAL_FILE  = join(homedir(), 'briefing-data', 'maintenance-proposal.md
 
 const REGRESSION_MODEL = 'claude-haiku-4-5'; // mechanical: rule-violation detection
 
+/**
+ * Rules the Haiku regression checker CANNOT judge reliably — it false-positives
+ * on them even when the briefing applies them correctly (verified 2026-08-11:
+ * cash-position flagged on a line that verbatim-matched the rule). These are
+ * already hardcoded in the assembler AND enforced by the Sonnet validator
+ * (cash-position = validator check #14), so the Haiku pass is redundant here —
+ * excluding them removes months of false-positive proposal noise without losing
+ * real coverage. Re-checking them belongs to the validator, not this pass.
+ */
+const REGRESSION_CHECK_SKIP = new Set<string>([
+  'cash-position-apple-disney', // Haiku flags the correct verbatim line; validator #14 enforces it
+  'igor-forecast-freshness',    // freshness now guaranteed by the Graph migration of the Igor source
+]);
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -267,7 +281,10 @@ export async function checkBriefingForRegressions(
   mode: 'morning' | 'afternoon' = 'morning',
 ): Promise<Regression[]> {
   try {
-    const promotedRules = await loadPromotedRules();
+    const allPromoted = await loadPromotedRules();
+    const promotedRules = allPromoted.filter(r => !REGRESSION_CHECK_SKIP.has(r.id));
+    const skipped = allPromoted.length - promotedRules.length;
+    if (skipped > 0) log(`skipping ${skipped} rule(s) the checker can't judge reliably (enforced by the validator instead)`);
 
     if (promotedRules.length === 0) {
       log('no promoted rules — skipping regression check');
