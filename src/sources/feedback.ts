@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { runOsascript } from '../utils/retry-osascript';
+import { graphGet, isGraphConfigured } from './graph-client';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -36,7 +37,52 @@ interface FeedbackEntry {
 }
 
 /**
- * Scans Gmail sent/inbox for +/− feedback replies from Jonathan,
+ * Graph replacement for the Apple Mail feedback scan. Returns "date|||subject|||body"
+ * lines — the SAME shape the osascript produced — so the caller's parse loop is
+ * unchanged. Matches the same messages the AppleScript did: last 7 days, subject
+ * contains "+", and either addressed to the briefing address OR the subject starts
+ * with a +/−/- marker; excludes "Briefing Test".
+ */
+async function fetchFeedbackViaGraph(smtpUser: string): Promise<string[]> {
+  const cutoffIso = new Date(Date.now() - 7 * 86400 * 1000).toISOString();
+  const smtp = smtpUser.toLowerCase();
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  for (const folder of ['inbox', 'sentitems'] as const) {
+    const dateField = folder === 'sentitems' ? 'sentDateTime' : 'receivedDateTime';
+    let resp: any;
+    try {
+      resp = await graphGet(`/me/mailFolders/${folder}/messages`, {
+        '$filter': `${dateField} ge ${cutoffIso}`,
+        '$top': '50',
+        '$orderby': `${dateField} desc`,
+        '$select': `subject,${dateField},bodyPreview,toRecipients`,
+      });
+    } catch (err: any) {
+      console.log(`[feedback] Graph ${folder} fetch failed: ${err.message?.slice(0, 60)}`);
+      continue;
+    }
+    for (const m of resp?.value || []) {
+      const subj = (m.subject || '').trim();
+      if (!subj || !subj.includes('+') || /briefing test/i.test(subj)) continue;
+      const toSmtp = (m.toRecipients || []).some((r: any) => (r.emailAddress?.address || '').toLowerCase() === smtp);
+      const startsMarker = /^[+\-−]/.test(subj);
+      if (!toSmtp && !startsMarker) continue;
+      const dt = m[dateField];
+      const date = dt ? new Date(dt).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+      const key = `${date}|${subj}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const body = (m.bodyPreview || '').replace(/\r?\n/g, ' ').slice(0, 200);
+      out.push(`${date}|||${subj}|||${body}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Scans M365 (Graph) sent/inbox for +/− feedback replies from Jonathan,
  * and returns accumulated feedback for the prompt.
  */
 export async function fetchFeedback(): Promise<string> {
@@ -81,15 +127,24 @@ tell application "Mail"
 end tell`;
 
   try {
-    if (!(await isMailRunning())) {
-      console.log('[feedback] Mail not running — skipping scan, using cached feedback');
-      throw new Error('mail-not-running');  // caught below → falls through to cached notes
+    let lines: string[];
+    if (isGraphConfigured()) {
+      // MS Graph FIRST — read feedback replies straight from M365, no Apple Mail
+      // and no osascript. This source was the original cause of the pipeline hang
+      // (a Mail Apple-Event that ignored SIGTERM); Graph removes that dependency.
+      lines = await fetchFeedbackViaGraph(smtpUser);
+      console.log(`[feedback] Graph API: ${lines.length} feedback message(s) in last 7d`);
+    } else if (await isMailRunning()) {
+      // Fallback: Apple Mail scan when Graph isn't configured.
+      const scriptPath = join(homedir(), 'briefing-data', 'feedback.applescript');
+      await writeFile(scriptPath, script, 'utf-8');
+      const stdout = await runOsascript(scriptPath);
+      lines = stdout.trim().split('\n').filter(Boolean);
+    } else {
+      console.log('[feedback] Graph not configured and Mail not running — using cached feedback');
+      lines = [];
     }
-    const scriptPath = join(homedir(), 'briefing-data', 'feedback.applescript');
-    await writeFile(scriptPath, script, 'utf-8');
-    const stdout = await runOsascript(scriptPath);
 
-    const lines = stdout.trim().split('\n').filter(Boolean);
     for (const line of lines) {
       const [date, subject, body] = line.split('|||');
       if (!subject) continue;
