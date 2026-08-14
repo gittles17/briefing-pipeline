@@ -270,10 +270,23 @@ async function run() {
         }
       }
 
-      bodyLines.push(
-        '',
-        'If a source is STILL down after auto-heal, the likely cause is Full Disk Access revoked for the scheduled job — grant it to /bin/bash in System Settings → Privacy & Security, then run `npm run check-access`. (macOS blocks scripting this grant, so it is the one thing auto-heal cannot do.)',
-      );
+      // Only give the Full Disk Access instruction when the evidence actually
+      // points there — i.e. something BROKE and the access probe was denied for
+      // every broken source (that's the only case buildBanner() attributes to
+      // FDA). It used to be appended unconditionally, so ✅ recovery notices and
+      // plain no-data alerts both told Jonathan to go re-grant FDA, which sent
+      // three separate investigations down the wrong path.
+      if (broke.length && /Full Disk Access may be revoked/.test(health.banner)) {
+        bodyLines.push(
+          '',
+          'If a source is STILL down after auto-heal, the likely cause is Full Disk Access revoked for the scheduled job — grant it to /bin/bash in System Settings → Privacy & Security, then run `npm run check-access`. (macOS blocks scripting this grant, so it is the one thing auto-heal cannot do.)',
+        );
+      } else if (broke.length) {
+        bodyLines.push(
+          '',
+          'Access looks fine (the sources read their staged copies successfully), so this is NOT a Full Disk Access problem — check ~/briefing-data/briefing.log for the failing read on the named source.',
+        );
+      }
 
       await sendAlertEmail(subject, bodyLines.join('\n'));
     }

@@ -24,6 +24,7 @@ import { readdir, access, readFile, writeFile, stat } from 'fs/promises';
 import { constants as fsConstants } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { isStagedCopyValid } from '../utils/staging-freshness';
 
 export type SourceKey = 'reminders' | 'imessage' | 'calendar';
 export type AccessState = 'ok' | 'denied';
@@ -89,13 +90,16 @@ const STATE_PATH = join(homedir(), 'briefing-data', 'source-health.json');
 // functionally healthy even when the direct probe is denied.
 const STAGING_DIR = join(homedir(), 'briefing-data', 'staging');
 const STAGED_REMINDERS_DIR = join(STAGING_DIR, 'reminders-stores');
-const STAGING_MAX_AGE_MS = 30 * 60 * 1000;
 
-/** True if `path` exists and was modified within the staging freshness window. */
+/**
+ * True if `path` exists and its staged copy is valid for this run. Uses the
+ * shared run-anchored rule — NOT a 30-minute wall clock, which used to expire
+ * mid-run on slow runs and produce a false "Full Disk Access revoked" alarm.
+ */
 async function isFreshStaged(path: string): Promise<boolean> {
   try {
     const s = await stat(path);
-    return Date.now() - s.mtimeMs <= STAGING_MAX_AGE_MS;
+    return isStagedCopyValid(s.mtimeMs);
   } catch {
     return false;
   }
@@ -228,9 +232,20 @@ export async function evaluateLocalHealth(
 ): Promise<HealthEvaluation> {
   try {
     const degraded: SourceKey[] = SOURCE_KEYS.filter(key => {
-      const probeDenied = probe?.[key] === 'denied';
-      const valueSentinel = isUnavailableSentinel(values?.[key]);
-      return probeDenied || valueSentinel;
+      const value = values?.[key];
+      const hasContent = typeof value === 'string' && value.trim() !== '';
+      const valueSentinel = isUnavailableSentinel(value);
+
+      // DATA IS AUTHORITATIVE. If the source actually produced content this run,
+      // it is healthy — whatever a probe of the protected ORIGINAL says. Under
+      // launchd that probe is EPERM by design (node is TCC-denied; the pipeline
+      // reads staged copies instead), so OR-ing it in used to declare sources
+      // "down" on runs whose data had loaded perfectly. That was the recurring
+      // false "Full Disk Access revoked" alert. Only a real no-data sentinel,
+      // or a denied probe with no value at all, counts as degraded now.
+      if (hasContent && !valueSentinel) return false;
+      if (valueSentinel) return true;
+      return probe?.[key] === 'denied';
     });
 
     const prior = await loadPriorDegraded();
@@ -242,7 +257,7 @@ export async function evaluateLocalHealth(
       else if (!nowDegraded && wasDegraded) transitions.push({ source: key, kind: 'recovered' });
     }
 
-    const banner = buildBanner(degraded);
+    const banner = buildBanner(degraded, probe);
     if (degraded.length) {
       console.log(
         `[local-health] degraded: ${degraded.join(', ')}${transitions.length ? ` | transitions: ${transitions.map(t => `${t.source}:${t.kind}`).join(', ')}` : ''}`,
@@ -256,17 +271,33 @@ export async function evaluateLocalHealth(
   }
 }
 
-/** Build the 🛑 markdown banner. Returns '' when nothing is degraded. */
-function buildBanner(degraded: SourceKey[]): string {
+/**
+ * Build the 🛑 markdown banner. Returns '' when nothing is degraded.
+ *
+ * Only blames Full Disk Access when the access probe actually supports that
+ * conclusion (every degraded source probed 'denied' AND had no staged copy to
+ * fall back on). Otherwise it says the sources returned no data and leaves the
+ * cause open — three past alerts asserted "FDA revoked" when FDA was fine, which
+ * sent the fix in the wrong direction.
+ */
+function buildBanner(degraded: SourceKey[], probe?: ProbeResult): string {
   if (!degraded.length) return '';
   const labels = degraded.map(k => SOURCE_LABELS[k]);
   const list = joinWithAnd(labels);
   const verb = degraded.length === 1 ? 'is' : 'are';
+
+  const allProbesDenied = probe ? degraded.every(k => probe[k] === 'denied') : false;
+  if (allProbesDenied) {
+    return (
+      `🛑 **Data access issue:** ${list} ${verb} unavailable and the access probe was denied ` +
+      `(Full Disk Access may be revoked for the scheduled job). ` +
+      `Fix: grant Full Disk Access to /bin/bash in System Settings → Privacy & Security, ` +
+      `then run \`npm run check-access\`.`
+    );
+  }
   return (
-    `🛑 **Data access issue:** ${list} ${verb} unavailable ` +
-    `(Full Disk Access likely revoked for the scheduled job). ` +
-    `Fix: grant Full Disk Access to /bin/bash in System Settings → Privacy & Security, ` +
-    `then run \`npm run check-access\`.`
+    `🛑 **Data missing:** ${list} returned no data this run (access itself looks fine — ` +
+    `check the run log for the failing read, not Full Disk Access).`
   );
 }
 

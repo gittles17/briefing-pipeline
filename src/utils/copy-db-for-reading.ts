@@ -1,6 +1,7 @@
 import { copyFile, mkdtemp, rm, stat } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
 import { join, basename } from 'path';
+import { isStagedCopyValid } from './staging-freshness';
 
 // Staged copies written by stage-protected.sh (sourced by the launchd bash
 // wrapper immediately before the pipeline starts). Under launchd, node cannot
@@ -9,17 +10,20 @@ import { join, basename } from 'path';
 // poisons node's whole subtree (even /bin/cp spawned from node is denied). So
 // bash stages the copies first, and we read those.
 const STAGING_DIR = join(homedir(), 'briefing-data', 'staging');
-// Anything older than this is a leftover from a previous run, not this run's
-// staging pass — fall back to the original path (interactive contexts have
-// their own FDA and read the originals fine).
-const STAGING_MAX_AGE_MS = 30 * 60 * 1000;
 
-/** Return the fresh staged copy of sourcePath, or null if absent/stale. */
+/**
+ * Return the staged copy of sourcePath, or null if absent/not-this-run.
+ *
+ * Validity uses the shared run-anchored rule: a copy staged for THIS run stays
+ * usable for the whole run. The previous 30-minute wall clock expired mid-run on
+ * slow runs, forcing a fallback to the protected original that node cannot read
+ * under launchd — which surfaced as EPERM and a false "FDA revoked" alert.
+ */
 async function stagedSourceFor(sourcePath: string): Promise<string | null> {
   try {
     const candidate = join(STAGING_DIR, basename(sourcePath));
     const s = await stat(candidate);
-    if (Date.now() - s.mtimeMs > STAGING_MAX_AGE_MS) return null;
+    if (!isStagedCopyValid(s.mtimeMs)) return null;
     return candidate;
   } catch {
     return null;

@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { checkBriefingForRegressions } from './sources/regression-check';
+import { withTimeout } from './utils/with-timeout';
 
 // ---------------------------------------------------------------------------
 // Client & retry infrastructure (mirrors claude.ts — kept independent for A/B)
@@ -10,14 +11,32 @@ function getClient() {
   if (!_client) _client = new Anthropic({
     apiKey: process.env.ANTHROPIC_API_KEY,
     timeout: 120_000,
+    // The SDK retries internally on top of our withRetry loop. Left at the
+    // default (2) the two layers multiply: one logical call could burn ~9 HTTP
+    // attempts with no visibility in our logs. Observed 2026-08-14: a single
+    // assembler call took 1783s (29.7 min) without emitting ONE retry line,
+    // which stretched the run to 40 min. Keep the SDK's own retrying minimal and
+    // let our loop own it, where it is logged and bounded.
+    maxRetries: 1,
   });
   return _client;
 }
 
+/**
+ * Hard wall-clock ceiling per model call. The SDK's `timeout` option did not
+ * bound the real elapsed time (see maxRetries note above), so we race every call
+ * against our own clock — the same fix that stopped the osascript hang. Normal
+ * calls finish in 15-30s; 180s is generous headroom before we retry.
+ */
+const CALL_TIMEOUT_MS = 180_000;
+
 async function withRetry<T>(fn: () => Promise<T>, label: string, retries = 3): Promise<T> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      return await fn();
+      // withTimeout rejects with "... timed out after Ns", which the isTimeout
+      // check below matches — so a stalled call retries visibly instead of
+      // silently consuming half an hour.
+      return await withTimeout(fn(), CALL_TIMEOUT_MS, label);
     } catch (err: any) {
       const isTimeout = err.message?.includes('timed out') || err.message?.includes('timeout');
       const isOverloaded = err.status === 529 || err.status === 503;
