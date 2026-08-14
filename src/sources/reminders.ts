@@ -20,6 +20,7 @@ import { join } from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { runOsascript } from '../utils/retry-osascript';
+import { isStagedCopyValid } from '../utils/staging-freshness';
 
 const exec = promisify(execFile);
 
@@ -39,10 +40,14 @@ const STORE_DIR = join(
 // protected Stores dir directly — a stale per-binary TCC deny on node
 // overrides the /bin/bash FDA grant — so bash stages copies and we read those.
 const STAGED_STORE_DIR = join(homedir(), 'briefing-data', 'staging', 'reminders-stores');
-const STAGING_MAX_AGE_MS = 30 * 60 * 1000;
 
-/** Largest .sqlite in a dir; when maxAgeMs is set, only files modified within it. */
-async function pickLargestSqlite(dir: string, maxAgeMs: number | null): Promise<string | null> {
+/**
+ * Largest .sqlite in a dir. When `requireValidStaging` is true, only files whose
+ * staged copy is valid for THIS run count (shared run-anchored rule — not a
+ * 30-minute wall clock, which expired mid-run on slow runs and forced a fallback
+ * to the protected original that node cannot read under launchd).
+ */
+async function pickLargestSqlite(dir: string, requireValidStaging: boolean): Promise<string | null> {
   try {
     const files = await readdir(dir);
     const candidates = files.filter(f => f.endsWith('.sqlite'));
@@ -52,7 +57,7 @@ async function pickLargestSqlite(dir: string, maxAgeMs: number | null): Promise<
       const p = join(dir, f);
       try {
         const s = await stat(p);
-        if (maxAgeMs !== null && Date.now() - s.mtimeMs > maxAgeMs) continue;
+        if (requireValidStaging && !isStagedCopyValid(s.mtimeMs)) continue;
         if (!best || s.size > best.size) best = { path: p, size: s.size };
       } catch {}
     }
@@ -66,12 +71,12 @@ async function pickLargestSqlite(dir: string, maxAgeMs: number | null): Promise<
 async function findActiveDb(): Promise<string | null> {
   // Fresh staged copy first (scheduled runs), then the protected original
   // (interactive contexts have their own FDA and read it directly).
-  const staged = await pickLargestSqlite(STAGED_STORE_DIR, STAGING_MAX_AGE_MS);
+  const staged = await pickLargestSqlite(STAGED_STORE_DIR, true);
   if (staged) {
     console.log('[reminders] using staged store copy');
     return staged;
   }
-  return pickLargestSqlite(STORE_DIR, null);
+  return pickLargestSqlite(STORE_DIR, false);
 }
 
 /** Run the SQL query against the Reminders DB. Returns formatted text or null. */

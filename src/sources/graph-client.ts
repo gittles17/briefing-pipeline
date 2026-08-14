@@ -27,6 +27,17 @@ export function classifyAuthError(
   body: string,
 ): { cause: 'secret-expired' | 'refresh-dead' | 'consent' | 'other'; banner: string } {
   const code = (body.match(/AADSTS\d+/) || [])[0] || '';
+  // Never reached the token endpoint (DNS/Wi-Fi/connection). NOT an auth problem
+  // — nothing to rotate or re-consent; it is transient and retried in-run.
+  if (status === 0 || /^network:/.test(body.trim())) {
+    return {
+      cause: 'other',
+      banner:
+        '⚠️ Graph could not reach Microsoft to refresh the token this run (network error, not an auth problem) — ' +
+        'Mail/Calendar/Teams/Igor/collections fell back to cached data. Usually transient; ' +
+        'if it repeats, check connectivity at run time (~00:06) in ~/briefing-data/briefing.log.',
+    };
+  }
   // Expired/invalid client secret — the app credential, NOT the user token.
   if (/AADSTS7000222|AADSTS7000215/.test(code) || /client secret.*expired|invalid_client/i.test(body)) {
     return {
@@ -176,6 +187,33 @@ async function getAccessToken(): Promise<string | null> {
   }
 }
 
+/**
+ * POST the token endpoint, retrying only THROWN (network-level) failures — DNS
+ * not resolving yet, Wi-Fi still associating after wake, connection reset. An
+ * HTTP error response is returned as-is so the caller can classify the AADSTS
+ * code; we never retry a real auth rejection.
+ */
+async function fetchTokenWithRetry(url: string, body: string, attempts = 3): Promise<Response> {
+  let lastErr: unknown;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      });
+    } catch (err: any) {
+      lastErr = err;
+      if (i < attempts) {
+        const delay = i * 3000;
+        console.log(`[graph] token endpoint unreachable (${err?.message?.slice(0, 60)}) — retry ${i}/${attempts - 1} in ${delay / 1000}s`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 /** The actual refresh logic, separated so it's protected by _inFlightRefresh. */
 async function doTokenRefresh(tenantId: string, clientId: string, clientSecret: string): Promise<string | null> {
   // CROSS-PROCESS LOCK around the whole read-refresh-write. The token file is
@@ -207,11 +245,14 @@ async function doTokenRefresh(tenantId: string, clientId: string, clientSecret: 
       scope: 'offline_access Mail.Read Calendars.Read Chat.Read',
     });
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body.toString(),
-    });
+    // Retry TRANSIENT NETWORK failures before giving up. A thrown fetch (DNS not
+    // up yet, Wi-Fi still associating, connection reset) is not an auth problem,
+    // but a single throw used to abandon the delegated refresh and drop straight
+    // to the app-only fallback — where every `/me` endpoint returns 400, taking
+    // out calendar, email, Teams, collections, Igor, Auris and feedback at once.
+    // Observed 2026-08-14 ("token refresh threw: fetch failed"): one retry would
+    // have saved the whole brief.
+    const res = await fetchTokenWithRetry(url, body.toString());
 
     if (res.ok) {
       const data = (await res.json()) as { access_token: string; refresh_token?: string; expires_in: number };
@@ -239,15 +280,38 @@ async function doTokenRefresh(tenantId: string, clientId: string, clientSecret: 
     return null;
   }).catch((err: any) => {
     console.log(`[graph] token refresh threw: ${err?.message?.slice(0, 120)}`);
+    // Record it so getGraphTokenHealth() reports a real cause instead of staying
+    // silent. Status 0 marks "never reached the endpoint" (network), which is a
+    // different problem from an AADSTS rejection.
+    _lastAuthError = { aadsts: '', status: 0, raw: `network: ${err?.message?.slice(0, 150) || 'unknown'}` };
     return null as string | null;
   });
 
   if (locked) return locked;
 
-  // Fall back to client credentials (app-only, needs Application permissions).
-  // NOTE: this ALSO uses the client secret, so it does NOT rescue an expired
-  // secret (AADSTS7000222) — it only helps when the delegated refresh token is
-  // the problem and app-only scopes are configured.
+  // App-only (client-credentials) fallback — DISABLED BY DEFAULT, and that is
+  // deliberate. Verified against this tenant 2026-08-14: the app registration has
+  // NO Application permissions granted, so an app-only token authenticates but
+  // cannot read anything the brief needs — mail/calendar return
+  // 403 ErrorAccessDenied and chats report "Roles on the request ''". Worse, every
+  // source calls `/me/...`, which app-only tokens reject outright with
+  // 400 "only valid with delegated authentication flow".
+  //
+  // So this path did real harm: it handed out a token that guaranteed failure on
+  // all eight Graph sources, and because it populated _accessToken it also made
+  // getGraphTokenHealth() report "healthy" — which is why the 2026-08-14 outage
+  // (delegated refresh lost to a transient network error) silently degraded the
+  // whole brief to caches with no banner. Returning null instead lets sources fall
+  // back to cache immediately AND lets the health check tell the truth.
+  //
+  // Kept (not removed) behind a flag: if IT ever grants Application permissions
+  // with admin consent, set GRAPH_APP_ONLY_FALLBACK=1 — note the callers would
+  // also need `/me/...` rewritten to `/users/{getUserEmail()}/...`.
+  if (process.env.GRAPH_APP_ONLY_FALLBACK !== '1') {
+    console.log('[graph] delegated refresh unavailable — skipping app-only fallback (no Application permissions in this tenant; it cannot serve /me endpoints)');
+    return null;
+  }
+
   try {
     const url = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
     const body = new URLSearchParams({
