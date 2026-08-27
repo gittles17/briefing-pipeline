@@ -97,6 +97,7 @@ interface BriefingData {
   industryIntel: string;
   replyEngineStatus?: string; // launchd PID + log freshness for Reply repo
   aurisStatus?: string;       // Auris Markets newsletter send-detection (empty if not a send day)
+  aurisRetroStatus?: string;  // one-line weekly harness-retro result (empty when no run in last 7 days)
   graphTokenHealth?: string;  // Graph auth health alert (empty when healthy)
   pendingProposal?: string; // pre-rendered Rule Maintenance markdown section, or empty string
 }
@@ -484,6 +485,9 @@ ${data.graphTokenHealth ? `## System Alert
 INCLUDE THIS AT THE TOP of the brief, before all other sections, in a callout-style line. Verbatim:
 ${data.graphTokenHealth}
 
+` : ''}${data.aurisRetroStatus ? `SYSTEM/OPS FOOTNOTE — include this line VERBATIM as the very LAST line of the brief, as a single italic FYI (wrap it in underscores: _…_). Do NOT add a header, do NOT reword, do NOT expand it, and do NOT place it near the top. It is a low-priority ops note about the coding harness, not an alert:
+${data.aurisRetroStatus}
+
 ` : ''}${isWeekend ? `FORMAT — WEEKEND BRIEFING (shorter, personal-first):
 
 ## The Big Picture
@@ -691,7 +695,7 @@ NOTION PROJECTS: ${data.notionProjects.slice(0, 1500)}
 IGOR FORECAST: ${data.igorForecast.slice(0, 2500)}
 ${data.collectionsReport ? `COLLECTIONS REPORT: ${data.collectionsReport}` : ''}
 RECURRING ALERTS: ${data.recurringAlerts}
-${data.replyEngineStatus ? `REPLY-ENGINE STATUS (use this to answer "is reply-engine firing?" — do NOT say "no data" if this block is present):\n${data.replyEngineStatus}\n` : ''}${data.aurisStatus ? `AURIS NEWSLETTER STATUS (use this verbatim for newsletter status — do NOT say "no data" or "no confirmation" if this block is present):\n${data.aurisStatus}\n` : ''}
+${data.replyEngineStatus ? `REPLY-ENGINE STATUS (use this to answer "is reply-engine firing?" — do NOT say "no data" if this block is present):\n${data.replyEngineStatus}\n` : ''}${data.aurisStatus ? `AURIS NEWSLETTER STATUS (use this verbatim for newsletter status — do NOT say "no data" or "no confirmation" if this block is present):\n${data.aurisStatus}\n` : ''}${data.aurisRetroStatus ? `HARNESS RETRO OPS NOTE (ground truth — a single italic FYI line that belongs at the very END of the brief; keep it verbatim if the draft contains it, do NOT remove it as unsourced and do NOT expand it):\n${data.aurisRetroStatus}\n` : ''}
 ${data.actionItems ? `ACTION ITEMS: ${data.actionItems.slice(0, 1000)}` : ''}
 ${data.teamsMessages ? `TEAMS: ${data.teamsMessages.slice(0, 1000)}` : ''}
 

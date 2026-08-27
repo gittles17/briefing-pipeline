@@ -18,6 +18,7 @@ import { fetchCollectionsReport } from './sources/collections';
 import { fetchIndustryIntel } from './sources/industry-intel';
 import { fetchReplyEngineStatus } from './sources/reply-engine-status';
 import { fetchAurisStatus } from './sources/auris-status';
+import { fetchAurisRetroStatus } from './sources/auris-retro-status';
 import { getGraphTokenHealth } from './sources/graph-client';
 import { loadRollingContext, archiveBriefing, saveContext } from './context';
 import { loadActionItems, updateActionItems } from './sources/action-items';
@@ -176,7 +177,7 @@ async function run() {
   const igorForecast = await withTimeout(fetchIgorForecast(), 120000, 'igor-forecast').then(v => ({ status: 'fulfilled' as const, value: v })).catch(() => ({ status: 'rejected' as const, reason: new Error('failed') }));
 
   console.log('[briefing] fetching remaining sources in parallel...');
-  const [calendar, yesterdayCalendar, email, luminate, imessages, tldr, notionProjects, feedback, rollingContext, claudeSessions, actionItems, teamsMessages, collectionsReport, industryIntel, replyEngineStatus, aurisStatus] = await Promise.allSettled([
+  const [calendar, yesterdayCalendar, email, luminate, imessages, tldr, notionProjects, feedback, rollingContext, claudeSessions, actionItems, teamsMessages, collectionsReport, industryIntel, replyEngineStatus, aurisStatus, aurisRetroStatus] = await Promise.allSettled([
     withTimeout(fetchICal(), 120000, 'calendar'),
     withTimeout(fetchYesterdayCalendar(), 120000, 'yesterday-calendar'),
     withTimeout(fetchAppleMail(), 120000, 'applemail'),
@@ -193,6 +194,7 @@ async function run() {
     withTimeout(fetchIndustryIntel(), 120000, 'industry-intel'),
     withTimeout(fetchReplyEngineStatus(), 60000, 'reply-engine'),
     withTimeout(fetchAurisStatus(), 120000, 'auris'),
+    withTimeout(fetchAurisRetroStatus(), 30000, 'auris-retro'),
   ]);
 
   const data = {
@@ -217,6 +219,7 @@ async function run() {
     industryIntel: industryIntel.status === 'fulfilled' ? industryIntel.value : '',
     replyEngineStatus: replyEngineStatus.status === 'fulfilled' ? replyEngineStatus.value : '',
     aurisStatus: aurisStatus.status === 'fulfilled' ? aurisStatus.value : '',
+    aurisRetroStatus: aurisRetroStatus.status === 'fulfilled' ? (aurisRetroStatus.value ?? '') : '',
     graphTokenHealth: await getGraphTokenHealth().catch(() => ''),
   };
 
