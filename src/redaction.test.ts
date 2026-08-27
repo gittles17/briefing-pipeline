@@ -102,6 +102,26 @@ check('key containing PASSWORD redacts value', () => {
   assert.equal(out, 'DB_PASSWORD=[redacted] ok');
 });
 
+check('_KEY-suffixed names redact short values', () => {
+  for (const s of ['ENCRYPTION_KEY=short1', 'SIGNING_KEY: shortkey123abcdefghij', 'MASTER_KEY=short1', 'SESSION_KEY=abc123']) {
+    const out = redact(`${s} ok`).text;
+    assert.ok(out.includes(REDACTED), `${s} -> ${out}`);
+    assert.ok(!out.includes(s.split(/[:=]\s*/)[1]), `${s} -> ${out}`);
+  }
+});
+
+check('_KEY mid-name still redacts (trailing wildcard preserved)', () => {
+  const out = redact('API_KEY_PROD=abc123def next').text;
+  assert.equal(out, 'API_KEY_PROD=[redacted] next');
+});
+
+check('KEY without underscore is untouched (MONKEY/TURKEY safe)', () => {
+  const s = 'MONKEY=banana and TURKEY=dinner are fine';
+  const r = redact(s);
+  assert.equal(r.text, s);
+  assert.equal(r.redactedChars, 0);
+});
+
 check('long base64 run (>=40) redacted', () => {
   const blob = 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVoxMjM0NTY3ODkw';
   assert.ok(blob.length >= 40);

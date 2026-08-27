@@ -141,9 +141,11 @@ const MONTHS: Record<string, string> = {
 const REDACTION_RULES: { re: RegExp; keepPrefix?: boolean }[] = [
   // KEY=VALUE / KEY: VALUE secret assignments — keep the key+separator, redact
   // the value (quoted or bare). Matches any key containing these tokens
-  // (e.g. OPENAI_API_KEY, DB_PASSWORD, AUTH_TOKEN).
+  // (e.g. OPENAI_API_KEY, DB_PASSWORD, AUTH_TOKEN) or ending in _KEY / KEY
+  // (e.g. ENCRYPTION_KEY, SIGNING_KEY, MASTER_KEY), so short secret values
+  // that the ≥40-char opaque-string backstop would miss are still scrubbed.
   {
-    re: /([A-Za-z0-9_]*(?:DATABASE_URL|API_KEY|SECRET|TOKEN|PASSWORD)[A-Za-z0-9_]*\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s"'`,;]+)/gi,
+    re: /([A-Za-z0-9_]*(?:DATABASE_URL|API_KEY|SECRET|TOKEN|PASSWORD|_KEY)[A-Za-z0-9_]*\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s"'`,;]+)/gi,
     keepPrefix: true,
   },
   // URLs embedding credentials: scheme://user:pass@host — keep the scheme,
