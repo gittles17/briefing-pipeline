@@ -49,9 +49,9 @@ export interface Candidate {
   signals: string[];
   /** Count of STRONG (correction-specific) signals — used for ranking. */
   strongCount: number;
-  /** The human message, trimmed to ~600 chars. */
+  /** The human message, trimmed to ~600 chars, with secrets redacted. */
   userMessage: string;
-  /** Up to ~400 chars of the preceding assistant text, for context. */
+  /** Up to ~400 chars of the preceding assistant text, secrets redacted. */
   precedingAssistant: string;
 }
 
@@ -71,8 +71,18 @@ const CONTEXT_MAX = 400;
 const DEFAULT_PAYLOAD_CAP = 80 * 1024;
 /** Weak signals are noisy inside long task briefs; only trust them when short. */
 const WEAK_SIGNAL_MAX_LEN = 500;
+/**
+ * STRONG signals only count when they land in the first ~300 chars of the
+ * message. A real correction leads with it ("No, that's wrong — …"); the same
+ * words buried deep in a long task brief are almost always incidental prose,
+ * which used to trip the filter. (Chosen over a blanket message-length cap so
+ * short, genuine corrections are never missed regardless of what follows.)
+ */
+const STRONG_SIGNAL_HEAD_LEN = 300;
 const REPEAT_MIN_LEN = 25;
 const REPEAT_JACCARD = 0.85;
+/** If more than this fraction of a candidate's text is secrets, drop it. */
+const MAX_REDACTED_FRACTION = 0.5;
 
 /**
  * STRONG signals name a correction directly and count regardless of length.
@@ -113,6 +123,83 @@ const MONTHS: Record<string, string> = {
   jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
   jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
 };
+
+// ---------------------------------------------------------------------------
+// Secret redaction
+//
+// Applied to EVERY candidate message and assistant-context snippet at
+// extraction time (below), so no unscrubbed transcript text can ever reach the
+// LLM payload or the committed PR evidence. Pure and deterministic so it can be
+// unit-tested (see src/redaction.test.ts).
+// ---------------------------------------------------------------------------
+
+/**
+ * Each rule redacts its match. When `keepPrefix` is set, capture group 1 is the
+ * leading label kept verbatim (e.g. `Bearer `, `API_KEY=`, `scheme://`) and
+ * only the remainder of the match is scrubbed. All patterns are global.
+ */
+const REDACTION_RULES: { re: RegExp; keepPrefix?: boolean }[] = [
+  // KEY=VALUE / KEY: VALUE secret assignments — keep the key+separator, redact
+  // the value (quoted or bare). Matches any key containing these tokens
+  // (e.g. OPENAI_API_KEY, DB_PASSWORD, AUTH_TOKEN).
+  {
+    re: /([A-Za-z0-9_]*(?:DATABASE_URL|API_KEY|SECRET|TOKEN|PASSWORD)[A-Za-z0-9_]*\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s"'`,;]+)/gi,
+    keepPrefix: true,
+  },
+  // URLs embedding credentials: scheme://user:pass@host — keep the scheme,
+  // redact user:pass, leave @host (matched via lookahead so it survives).
+  {
+    re: /([a-z][a-z0-9+.\-]*:\/\/)[^\s:/@]+:[^\s:/@]+(?=@)/gi,
+    keepPrefix: true,
+  },
+  // Authorization: Bearer <token> — keep the label, redact the token.
+  { re: /(Bearer\s+)[A-Za-z0-9._\-+/=]+/gi, keepPrefix: true },
+  // Provider keys/tokens with recognizable prefixes.
+  { re: /\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}/g },   // OpenAI / Anthropic
+  { re: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g },     // GitHub PATs (ghp_/gho_/ghu_/…)
+  { re: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g },   // GitHub fine-grained PATs
+  { re: /\bAKIA[A-Z0-9]{16}\b/g },               // AWS access key IDs
+  { re: /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g }, // JWTs
+  // Catch-all: long opaque base64/hex runs (hex is a subset of this charset).
+  { re: /[A-Za-z0-9+/]{40,}={0,2}/g },
+];
+
+/**
+ * Redacts secrets from `input`, collapsing each secret run to `[redacted]`.
+ * Returns the scrubbed text plus the number of ORIGINAL characters redacted,
+ * so callers can drop candidates that are mostly secret. Pure function.
+ */
+export function redact(input: string): { text: string; redactedChars: number } {
+  if (!input) return { text: input, redactedChars: 0 };
+
+  const mask = new Array<boolean>(input.length).fill(false);
+  for (const rule of REDACTION_RULES) {
+    rule.re.lastIndex = 0;
+    for (const m of input.matchAll(rule.re)) {
+      const start = m.index ?? 0;
+      const prefixLen = rule.keepPrefix && m[1] ? m[1].length : 0;
+      const end = start + m[0].length;
+      for (let i = start + prefixLen; i < end; i++) mask[i] = true;
+    }
+  }
+
+  let out = '';
+  let redactedChars = 0;
+  let i = 0;
+  while (i < input.length) {
+    if (mask[i]) {
+      let j = i;
+      while (j < input.length && mask[j]) j++;
+      out += '[redacted]';
+      redactedChars += j - i;
+      i = j;
+    } else {
+      out += input[i];
+      i++;
+    }
+  }
+  return { text: out, redactedChars };
+}
 
 interface Turn {
   role: 'user' | 'assistant';
@@ -212,7 +299,11 @@ function extractSessionCandidates(
     const { text, date } = extractUserText(turn.text, fallbackDate);
     if (!text || isAutoMessage(text)) continue;
 
-    const strong = STRONG_SIGNALS.filter(s => s.re.test(text)).map(s => s.name);
+    // STRONG signals only count when they appear in the message head; buried
+    // deep in a long brief they are almost always incidental (see the constant).
+    const strong = STRONG_SIGNALS
+      .filter(s => s.re.test(text.slice(0, STRONG_SIGNAL_HEAD_LEN)))
+      .map(s => s.name);
     const weak = text.length < WEAK_SIGNAL_MAX_LEN
       ? WEAK_SIGNALS.filter(s => s.re.test(text)).map(s => s.name)
       : [];
@@ -229,13 +320,22 @@ function extractSessionCandidates(
     // which also excludes the session's opening task brief.
     if (signals.length === 0 || lastAssistant === null) continue;
 
+    // Scrub secrets before anything leaves this function. Drop candidates whose
+    // text is mostly secret — they carry no usable correction signal anyway.
+    const slicedUser = text.slice(0, USER_MESSAGE_MAX);
+    const scrubbedUser = redact(slicedUser);
+    if (slicedUser.length > 0 &&
+        scrubbedUser.redactedChars / slicedUser.length > MAX_REDACTED_FRACTION) {
+      continue;
+    }
+
     candidates.push({
       sessionId,
       date,
       signals,
       strongCount: strong.length,
-      userMessage: text.slice(0, USER_MESSAGE_MAX),
-      precedingAssistant: lastAssistant.slice(-CONTEXT_MAX),
+      userMessage: scrubbedUser.text,
+      precedingAssistant: redact(lastAssistant.slice(-CONTEXT_MAX)).text,
     });
   }
 

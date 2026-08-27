@@ -164,9 +164,33 @@ function extractText(msg: Anthropic.Message): string {
 // gh CLI helpers (pure REST via the authenticated gh CLI — no local checkout)
 // ---------------------------------------------------------------------------
 
+/**
+ * Minimal environment for the gh child. gh authenticates via the macOS keyring
+ * and needs only PATH (to be found on disk) and HOME (to locate ~/.config/gh).
+ * We pass an explicit allow-list rather than the full process env so none of the
+ * pipeline's .env secrets (ANTHROPIC_API_KEY, DATABASE_URL, …) leak into the
+ * child. Token / config-dir overrides are forwarded only when actually set.
+ */
+function ghEnv(): NodeJS.ProcessEnv {
+  const allow = ['PATH', 'HOME', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_HOST', 'GH_CONFIG_DIR', 'XDG_CONFIG_HOME'];
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of allow) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
+/** True when a gh api error is a genuine 404 (resource absent), not transient. */
+function isNotFoundError(err: any): boolean {
+  return typeof err?.message === 'string'
+    && err.message.includes('exited 1')
+    && /404|Not Found/i.test(err.message);
+}
+
 function runGh(args: string[], input?: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn('gh', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('gh', args, { stdio: ['pipe', 'pipe', 'pipe'], env: ghEnv() });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', d => { stdout += d.toString(); });
@@ -200,7 +224,7 @@ async function ghGetFileJson(
     const content = Buffer.from(json.content ?? '', 'base64').toString('utf-8');
     return { content, sha: json.sha };
   } catch (err: any) {
-    if (err.message?.includes('exited 1') && /404|Not Found/i.test(err.message)) return null;
+    if (isNotFoundError(err)) return null;
     throw err;
   }
 }
@@ -218,8 +242,25 @@ async function fetchRuleInventory(): Promise<{ files: RuleFile[]; names: Set<str
   for (const entry of entries) {
     if (entry.type !== 'file' || !entry.name.endsWith('.mdc')) continue;
     names.add(entry.name);
-    const raw = await ghGetRaw(`${RULES_DIR}/${entry.name}`, 'main').catch(() => '');
-    const firstLines = raw.split('\n').slice(0, 15).join('\n');
+
+    // Distinguish a genuine 404 (file vanished between listing and fetch → treat
+    // as empty) from a transient failure. Swallowing the latter would make the
+    // rule look empty and let the judge propose a near-duplicate of a rule that
+    // actually exists — so abort the whole run instead. Skipping a week is safer.
+    let firstLines = '';
+    try {
+      const raw = await ghGetRaw(`${RULES_DIR}/${entry.name}`, 'main');
+      firstLines = raw.split('\n').slice(0, 15).join('\n');
+    } catch (err: any) {
+      if (!isNotFoundError(err)) {
+        log(
+          `FATAL: rule-inventory fetch for ${entry.name} failed and was not a 404 ` +
+          `(${err.message}) — aborting rather than risk proposing near-duplicates`,
+        );
+        throw err;
+      }
+    }
+
     files.push({ name: entry.name, firstLines });
   }
 
@@ -474,6 +515,21 @@ async function openPullRequest(branch: string, date: string, prBody: string): Pr
   return json.html_url as string;
 }
 
+/**
+ * Best-effort deletion of a branch ref, used when delivery fails after the
+ * branch was created so we don't leave an orphan retro/* branch behind. Logs
+ * the attempt either way and never throws (the original failure is the story).
+ */
+async function deleteOrphanBranch(branch: string): Promise<void> {
+  log(`cleaning up orphan branch ${branch} after failed delivery`);
+  try {
+    await runGh(['api', '--method', 'DELETE', `repos/${REPO}/git/refs/heads/${branch}`]);
+    log(`deleted orphan branch ${branch}`);
+  } catch (err: any) {
+    log(`orphan-branch cleanup failed for ${branch} (manual cleanup may be needed): ${err.message}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // PR / dry-run body
 // ---------------------------------------------------------------------------
@@ -688,11 +744,18 @@ async function run(): Promise<void> {
   if (proposals.length > 0) {
     const branch = await createBranch(date);
     log(`created branch ${branch}`);
-    for (const proposal of proposals) {
-      await commitProposal(branch, proposal, date);
+    try {
+      for (const proposal of proposals) {
+        await commitProposal(branch, proposal, date);
+      }
+      prUrl = await openPullRequest(branch, date, prBody);
+      log(`opened PR: ${prUrl}`);
+    } catch (err) {
+      // Delivery broke mid-flight after the branch existed — remove it so a
+      // retry next run starts clean instead of colliding with an empty orphan.
+      await deleteOrphanBranch(branch);
+      throw err;
     }
-    prUrl = await openPullRequest(branch, date, prBody);
-    log(`opened PR: ${prUrl}`);
   } else {
     log('0 proposals — no branch, no PR');
   }
