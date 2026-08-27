@@ -91,6 +91,7 @@ interface RunRecord {
   candidatesFound: number;
   proposalsMade: number;
   prUrl: string;
+  stalenessFlags: string[];
 }
 
 interface RetroState {
@@ -770,6 +771,7 @@ async function run(): Promise<void> {
     candidatesFound: prefilter.candidates.length,
     proposalsMade: proposals.length,
     prUrl,
+    stalenessFlags: flags,
   };
 
   await writeState({ processedSessions: newProcessed, runs: [...state.runs, runRecord] });
